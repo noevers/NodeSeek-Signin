@@ -2,11 +2,14 @@
 
 import os
 import time
-import json
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from curl_cffi import requests
 from yescaptcha import YesCaptchaSolver, YesCaptchaSolverError
 from turnstile_solver import TurnstileSolver, TurnstileSolverError
+
+# 统一 impersonate 版本，可通过环境变量 NS_IMPERSONATE 覆盖
+IMPERSONATE_VERSION = os.getenv("NS_IMPERSONATE", "chrome136")
 # ---------------- 通知模块动态加载 ----------------
 hadsend = False
 send = None
@@ -19,6 +22,10 @@ except ImportError:
 # ---------------- 环境检测函数 ----------------
 def detect_environment():
     """检测当前运行环境"""
+    # 优先检测是否在 Docker 环境中
+    if os.environ.get("IN_DOCKER") == "true":
+        return "docker"
+        
     # 检测是否在青龙环境中
     ql_path_markers = ['/ql/data/', '/ql/config/', '/ql/', '/.ql/']
     in_ql_env = False
@@ -137,12 +144,31 @@ def save_cookie_to_ql(var_name: str, cookie: str):
         print(f"青龙面板环境变量操作异常: {str(e)}")
         return False
 
+# ---------------- Docker Cookie 文件保存 ----------------
+COOKIE_FILE_PATH = "./cookie/NS_COOKIE.txt"
+
+def save_cookie_to_file(cookie_str: str):
+    """将Cookie保存到文件"""
+    try:
+        # 确保目录存在
+        os.makedirs(os.path.dirname(COOKIE_FILE_PATH), exist_ok=True)
+        with open(COOKIE_FILE_PATH, "w") as f:
+            f.write(cookie_str)
+        print(f"Cookie 已成功保存到文件: {COOKIE_FILE_PATH}")
+        return True
+    except Exception as e:
+        print(f"保存Cookie到文件失败: {e}")
+        return False
+
 # ---------------- 统一变量保存函数 ----------------
 def save_cookie(var_name: str, cookie: str):
     """根据当前环境保存Cookie到相应位置"""
     env_type = detect_environment()
     
-    if env_type == "qinglong":
+    if env_type == "docker":
+        print("检测到Docker环境，保存Cookie到文件...")
+        return save_cookie_to_file(cookie)
+    elif env_type == "qinglong":
         print("检测到青龙环境，保存变量到青龙面板...")
         return save_cookie_to_ql(var_name, cookie)
     elif env_type == "github":
@@ -180,7 +206,7 @@ def session_login(user, password, solver_type, api_base_url, client_key):
         print(f"验证码错误: {e}")
         return None
 
-    session = requests.Session(impersonate="chrome110")
+    session = requests.Session(impersonate=IMPERSONATE_VERSION)
     session.get("https://www.nodeseek.com/signIn.html")
 
     data = {
@@ -230,7 +256,11 @@ def sign(ns_cookie, ns_random):
     }
     try:
         url = f"https://www.nodeseek.com/api/attendance?random={ns_random}"
-        response = requests.post(url, headers=headers, impersonate="chrome110")
+        response = requests.post(url, headers=headers, impersonate=IMPERSONATE_VERSION)
+        if response.status_code == 403:
+            print("[ERROR] 403 Forbidden - 仍被 Cloudflare 阻拦")
+            print(f"[DEBUG] 响应内容: {response.text[:300]}")
+            return None
         data = response.json()
         msg = data.get("message", "")
         if "鸡腿" in msg or data.get("success"):
@@ -245,10 +275,13 @@ def sign(ns_cookie, ns_random):
 
 # ---------------- 查询签到收益统计函数 ----------------
 def get_signin_stats(ns_cookie, days=30):
-    """查询本月的签到收益统计"""
+    """查询前days天内的签到收益统计"""
     if not ns_cookie:
         return None, "无有效Cookie"
-        
+    
+    if days <= 0:
+        days = 1
+    
     headers = {
         'User-Agent': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0",
         'origin': "https://www.nodeseek.com",
@@ -258,18 +291,19 @@ def get_signin_stats(ns_cookie, days=30):
     
     try:
         # 使用UTC+8时区（上海时区）
-        utc_offset = timedelta(hours=8)
-        now_utc = datetime.utcnow()
-        now_shanghai = now_utc + utc_offset
-        current_month_start = datetime(now_shanghai.year, now_shanghai.month, 1)
+        shanghai_tz = ZoneInfo("Asia/Shanghai")
+        now_shanghai = datetime.now(shanghai_tz)
         
-        # 获取多页数据以确保覆盖本月所有数据
+        # 计算查询开始时间：当前时间减去指定天数
+        query_start_time = now_shanghai - timedelta(days=days)
+        
+        # 获取多页数据以确保覆盖指定天数内的所有数据
         all_records = []
         page = 1
         
-        while page <= 10:  # 最多查询10页，防止无限循环
+        while page <= 20:  # 最多查询20页，防止无限循环
             url = f"https://www.nodeseek.com/api/account/credit/page-{page}"
-            response = requests.get(url, headers=headers, impersonate="chrome110")
+            response = requests.get(url, headers=headers, impersonate=IMPERSONATE_VERSION)
             data = response.json()
             
             if not data.get("success") or not data.get("data"):
@@ -279,15 +313,17 @@ def get_signin_stats(ns_cookie, days=30):
             if not records:
                 break
                 
-            # 检查最后一条记录的时间，如果超出本月范围就停止
-            last_record_time = datetime.fromisoformat(records[-1][3].replace('Z', '+00:00'))
-            last_record_time_shanghai = last_record_time.replace(tzinfo=None) + utc_offset
-            if last_record_time_shanghai < current_month_start:
-                # 只添加在本月范围内的记录
+            # 检查最后一条记录的时间，如果超出查询范围就停止
+            last_record_time = datetime.fromisoformat(
+                records[-1][3].replace('Z', '+00:00'))
+            last_record_time_shanghai = last_record_time.astimezone(shanghai_tz)
+            if last_record_time_shanghai < query_start_time:
+                # 只添加在查询范围内的记录
                 for record in records:
-                    record_time = datetime.fromisoformat(record[3].replace('Z', '+00:00'))
-                    record_time_shanghai = record_time.replace(tzinfo=None) + utc_offset
-                    if record_time_shanghai >= current_month_start:
+                    record_time = datetime.fromisoformat(
+                        record[3].replace('Z', '+00:00'))
+                    record_time_shanghai = record_time.astimezone(shanghai_tz)
+                    if record_time_shanghai >= query_start_time:
                         all_records.append(record)
                 break
             else:
@@ -296,21 +332,27 @@ def get_signin_stats(ns_cookie, days=30):
             page += 1
             time.sleep(0.5)
         
-        # 筛选本月签到收益记录
+        # 筛选指定天数内的签到收益记录
         signin_records = []
         for record in all_records:
             amount, balance, description, timestamp = record
-            record_time = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-            record_time_shanghai = record_time.replace(tzinfo=None) + utc_offset
+            record_time = datetime.fromisoformat(
+                timestamp.replace('Z', '+00:00'))
+            record_time_shanghai = record_time.astimezone(shanghai_tz)
             
-            # 只统计本月的签到收益
-            if (record_time_shanghai >= current_month_start and 
-                "签到收益" in description and "鸡腿" in description):
+            # 只统计指定天数内的签到收益
+            if (record_time_shanghai >= query_start_time and
+                    "签到收益" in description and "鸡腿" in description):
                 signin_records.append({
                     'amount': amount,
                     'date': record_time_shanghai.strftime('%Y-%m-%d'),
                     'description': description
                 })
+        
+        # 生成时间范围描述
+        period_desc = f"近{days}天"
+        if days == 1:
+            period_desc = "今天"
         
         if not signin_records:
             return {
@@ -318,8 +360,8 @@ def get_signin_stats(ns_cookie, days=30):
                 'average': 0,
                 'days_count': 0,
                 'records': [],
-                'period': f"{now_shanghai.strftime('%Y年%m月')}"
-            }, "查询成功，但没有找到本月签到记录"
+                'period': period_desc,
+            }, f"查询成功，但没有找到{period_desc}的签到记录"
         
         # 统计数据
         total_amount = sum(record['amount'] for record in signin_records)
@@ -331,7 +373,7 @@ def get_signin_stats(ns_cookie, days=30):
             'average': average,
             'days_count': days_count,
             'records': signin_records,
-            'period': f"{now_shanghai.strftime('%Y年%m月')}"
+            'period': period_desc
         }
         
         return stats, "查询成功"
@@ -380,7 +422,21 @@ if __name__ == "__main__":
             break
     
     # 读取现有Cookie
-    all_cookies = os.getenv("NS_COOKIE", "")
+    all_cookies = ""
+    if detect_environment() == "docker":
+        print(f"Docker环境，尝试从 {COOKIE_FILE_PATH} 读取Cookie...")
+        if os.path.exists(COOKIE_FILE_PATH):
+            try:
+                with open(COOKIE_FILE_PATH, "r") as f:
+                    all_cookies = f.read().strip()
+                print("成功从文件加载Cookie。")
+            except Exception as e:
+                print(f"从文件读取Cookie失败: {e}")
+        else:
+            print("Cookie文件不存在，将使用空Cookie。")
+    else:
+        all_cookies = os.getenv("NS_COOKIE", "")
+        
     cookie_list = all_cookies.split("&")
     cookie_list = [c.strip() for c in cookie_list if c.strip()]
     
